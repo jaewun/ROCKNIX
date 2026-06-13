@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 ROCKNIX (https://github.com/ROCKNIX)
+
+. /etc/profile.d/001-functions
+
+MYSLEEPMODE=$(get_setting system.suspendmode)
+if [ -z "${MYSLEEPMODE}" ] || [ "${MYSLEEPMODE}" = "off" ]
+then
+  /usr/bin/suspendmode mem
+fi
+
+cat <<EOF >~/.config/logind.conf.d/login.conf
+[Login]
+HandlePowerKey=suspend
+HandleSuspendKey=suspend
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+HandleLidSwitchDocked=ignore
+EOF
+
+systemctl try-restart systemd-logind.service 2>/dev/null || true
