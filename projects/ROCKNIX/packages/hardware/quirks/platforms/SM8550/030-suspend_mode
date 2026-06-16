@@ -1,14 +1,45 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2023 JELOS (https://github.com/JustEnoughLinuxOS)
+# Copyright (C) 2026 ROCKNIX (https://github.com/ROCKNIX)
 
-### Sleep is currently broken, so we'll disable it.
+. /etc/profile.d/001-functions
 
-/usr/bin/suspendmode off
+# SM8550 deep suspend (S2RAM) is now supported, so default the SoC to deep ("mem")
+# suspend and route the power button to it (replaces the previous blanket disable).
 
-### Ignore power button presses for now, until we can finish up fixing sleep.
+# Pin deep-only FIRST, before enabling suspend, so there is no boot window where a
+# power event could see the fall-through list or a stale power-key binding.
+#
+# Drop systemd's "mem standby freeze" SuspendState fall-through: on SM8550 a deep
+# ("mem") attempt that fails and falls through to "freeze" (s2idle) parks forever in
+# s2idle_enter() -- the edge-triggered PMIC power-key wake is not re-delivered to
+# break the swait (lost wakeup), and with no hardware watchdog the device is then
+# unrecoverable. Deep resumes cleanly, so a failed deep should cleanly no-op instead
+# of degrading into the wedging s2idle path. SuspendState is parsed as a list
+# (drop-ins append), so reset it before pinning mem.
+mkdir -p /storage/.config/sleep.conf.d
+cat <<EOF >/storage/.config/sleep.conf.d/zz-sm8550-deeponly.conf
+[Sleep]
+SuspendState=
+SuspendState=mem
+EOF
+
 cat <<EOF >~/.config/logind.conf.d/login.conf
 [Login]
-HandlePowerKey=ignore
-HandleSuspendKey=ignore
+HandlePowerKey=suspend
+HandleSuspendKey=suspend
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+HandleLidSwitchDocked=ignore
 EOF
+
+# Now enable deep ("mem") suspend (sets AllowSuspend=yes + the system.suspendmode
+# setting). suspendmode restarts logind, which by now reads the config written above.
+MYSLEEPMODE=$(get_setting system.suspendmode)
+if [ -z "${MYSLEEPMODE}" ] || [ "${MYSLEEPMODE}" = "off" ]
+then
+  /usr/bin/suspendmode mem
+fi
+
+systemctl try-restart systemd-logind.service 2>/dev/null || true
