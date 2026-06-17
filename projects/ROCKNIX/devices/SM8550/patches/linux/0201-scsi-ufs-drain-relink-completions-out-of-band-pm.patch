@@ -1,5 +1,5 @@
 From: jaewun <jaewun@users.noreply.github.com>
-Subject: [PATCH] scsi: ufs: drain relink completions out-of-band during PM resume
+Subject: [PATCH] scsi: ufs: service out-of-band relink completions during PM and self-heal clk-gating hibern8-exit
 
 On this non-MCQ controller the UFS interrupt is request_threaded_irq(IRQF_ONESHOT
 | IRQF_SHARED) on a GIC-v3 SPI. When the primary handler returns IRQ_WAKE_THREAD,
@@ -12,11 +12,9 @@ hangs and, with no hardware watchdog, the device wedges until a manual power-cyc
 This bites hardest on the error-handler reset path. ufshcd_err_handler() diverts
 PM-context errors to link_recovery, so the reset_and_restore() it runs has
 pm_op_in_progress already cleared. The error IRQ that triggered the handler left
-the line IRQF_ONESHOT-masked (the primary returned IRQ_WAKE_THREAD and the threaded
-handler cannot run during the reset), and the relink's non-synchronising
-disable_irq() keeps genirq from unmasking it. With the line masked and the threaded
-handler unrunnable, ufshcd_intr() is never re-invoked and nothing services the
-relink's completions.
+the line IRQF_ONESHOT-masked and the relink's non-synchronising disable_irq() keeps
+genirq from unmasking it, so ufshcd_intr() is never re-invoked and nothing services
+the relink's completions.
 
 Service them without depending on the UFS IRQ firing:
 
@@ -26,22 +24,37 @@ Service them without depending on the UFS IRQ firing:
 
   - ufshcd_relinking() (pm_op_in_progress || relink_poll_active) scopes the drain
     to both the PM-resume relink and the EH reset_and_restore window; the EH arms
-    relink_poll_active + the poll timer around the reset and disarms after. The
-    poll timer is the load-bearing drain for the masked-line EH window; on the
-    resume path the inline hardirq drain already covers it (pm_op_in_progress is
-    set before the relink, so ufshcd_intr() takes the inline path and never leaves
-    the line oneshot-masked) and the timer is a cheap, reused belt-and-suspenders.
-
-  - ufshcd_relinking() also gates the non-synchronising disable_irq so the PM/EH
-    path cannot deadlock on the threaded handler it pre-empted.
+    relink_poll_active + the poll timer around the reset and disarms after. It also
+    gates the non-synchronising disable_irq so the PM/EH path cannot deadlock on
+    the threaded handler it pre-empted.
 
   - A stalled cold-relink DME_LINK_STARTUP (UIC error, no completion) is
     force-completed with UIC_CMD_RESULT_FAILURE so link startup can retry rather
     than wait forever.
 
-At dev-init-NOP time REG_INTERRUPT_ENABLE is already full (ufshcd_make_hba_
-operational sets UFSHCD_ENABLE_INTRS before ufshcd_verify_dev_init), so the
-IS-gated drain reaps the NOP completion directly; no doorbell-level reap is needed.
+  - On the reset_and_restore() path, ufshcd_complete_requests(force_compl=true)
+    only completed door-bell-cleared tags on this non-MCQ controller, so a request
+    stranded on a failed UIC/link op was never completed and its waiter -- a
+    SYNCHRONIZE CACHE issued from sd_suspend() during system suspend -- hung until
+    the DPM watchdog panicked. ufshcd_force_compl_one() now mirrors the MCQ force
+    path: every outstanding command is requeued with DID_REQUEUE so it retries on
+    the recovered link instead of stranding. The stale post-reset in-memory OCS is
+    not trusted.
+
+The SW clk-gating ungate hibern8 EXIT (ufshcd_ungate_work) runs during the suspend
+freezer phase with pm_op_in_progress==0. On the SM8550/SKhynix M-PHY it can
+-ETIMEDOUT when the link gated during a sub-ms micro-idle and I/O then needs it
+back. The default ufshcd_uic_pwr_ctrl path would mark the link broken and queue a
+fatal EH, which during the freeze strands in-flight ext4/jbd2 fsync I/O in D-state,
+fails the freezer, and hard-wedges the box. Mirror the runtime-resume self-heal:
+recover the link in-line via ufshcd_link_recovery() instead of going fatal,
+bracketed by the same relink poller so the out-of-band drain covers the relink's
+link-startup, and add !clk_gating.is_suspended to the ufshcd_uic_pwr_ctrl fatal
+guard so the clk-gating ungate window no longer trips set_link_broken +
+schedule_eh_work. SW clk-gating hibern8 (idle power) is preserved.
+
+At dev-init-NOP time REG_INTERRUPT_ENABLE is already full, so the IS-gated drain
+reaps the NOP completion directly; no doorbell-level reap is needed.
 
 Validated by RTC deep-suspend soaks (>=120s cold-rail dwell), bare and in a live
 gamescope/Steam session: the relink that previously wedged within 1-2 cycles now
@@ -102,7 +115,125 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  		hba->is_irq_enabled = false;
  	}
  }
-@@ -6863,6 +6898,17 @@
+@@ -1921,11 +1956,40 @@
+ 		hba->clk_gating.is_suspended = true;
+ 		if (ufshcd_is_link_hibern8(hba)) {
+ 			ret = ufshcd_uic_hibern8_exit(hba);
+-			if (ret)
+-				dev_err(hba->dev, "%s: hibern8 exit failed %d\n",
++			if (ret) {
++				/*
++				 * This SW clk-gating hibern8 exit runs outside any
++				 * PM op (pm_op_in_progress == 0) with IRQs enabled.
++				 * On this M-PHY it can -ETIMEDOUT; the default path
++				 * (ufshcd_uic_pwr_ctrl) would then mark the link
++				 * broken and schedule a fatal EH, which during the
++				 * suspend freeze strands in-flight fsync I/O and
++				 * wedges the box. Instead self-heal in-line via a
++				 * cold relink, mirroring the runtime-resume path.
++				 * Bracket it with the relink poller (inert on MCQ)
++				 * so the out-of-band completion drain covers the
++				 * relink's link-startup. The fatal EH for this exit
++				 * is suppressed by the !clk_gating.is_suspended term
++				 * in ufshcd_uic_pwr_ctrl.
++				 */
++				dev_err(hba->dev, "%s: hibern8 exit failed %d, recovering link\n",
+ 					__func__, ret);
+-			else
++				if (!hba->mcq_enabled) {
++					WRITE_ONCE(hba->relink_poll_active, true);
++					mod_timer(&hba->pm_poll_timer,
++						  jiffies + msecs_to_jiffies(2));
++				}
++				ret = ufshcd_link_recovery(hba);
++				if (!hba->mcq_enabled) {
++					WRITE_ONCE(hba->relink_poll_active, false);
++					timer_delete_sync(&hba->pm_poll_timer);
++				}
++				if (ret)
++					dev_err(hba->dev, "%s: link recovery after hibern8 exit failed %d\n",
++						__func__, ret);
++			} else {
+ 				ufshcd_set_link_active(hba);
++			}
+ 		}
+ 		hba->clk_gating.is_suspended = false;
+ 	}
+@@ -4382,7 +4446,15 @@
+ 	spin_lock_irqsave(hba->host->host_lock, flags);
+ 	hba->active_uic_cmd = NULL;
+ 	hba->uic_async_done = NULL;
+-	if (ret && !hba->pm_op_in_progress) {
++	/*
++	 * Suppress the fatal link-broken+EH path for the SW clk-gating ungate
++	 * hibern8 exit (clk_gating.is_suspended is set only in that window and the
++	 * PM-suspend path, which already has pm_op_in_progress). That exit runs
++	 * outside any PM op, so without this term a transient hibern8-exit -110
++	 * would wedge the box during the suspend freeze; ufshcd_ungate_work
++	 * instead self-heals via ufshcd_link_recovery.
++	 */
++	if (ret && !hba->pm_op_in_progress && !hba->clk_gating.is_suspended) {
+ 		ufshcd_set_link_broken(hba);
+ 		ufshcd_schedule_eh_work(hba);
+ 	}
+@@ -6383,11 +6455,55 @@
+ 	ufs_debugfs_exception_event(hba, status);
+ }
+ 
+-/* Complete requests that have door-bell cleared */
++/*
++ * Non-MCQ counterpart of ufshcd_mcq_force_compl_one(): invoked via
++ * ufshcd_complete_requests(force_compl=true) from ufshcd_host_reset_and_restore()
++ * (and the error handler) AFTER ufshcd_hba_stop() has reset the controller. The
++ * normal single-doorbell path (ufshcd_transfer_req_compl/ufshcd_poll) only
++ * completes tags whose doorbell bit reads back clear, so a request left
++ * outstanding by a failed UIC/link op (e.g. the SW clk-gating hibern8-exit
++ * recovered in ufshcd_ungate_work) is never completed and its waiter hangs --
++ * a SYNCHRONIZE CACHE in sd_suspend() then wedges the box until the DPM watchdog
++ * panics. The in-memory OCS is stale after the reset, so requeue SCSI commands
++ * (retry on the recovered link) rather than reporting a possibly-bogus result;
++ * reserved device-management tags are completed by their own paths and skipped
++ * (mirrors ufshcd_mcq_force_compl_one()).
++ */
++static bool ufshcd_force_compl_one(struct request *rq, void *priv)
++{
++	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++	struct scsi_device *sdev = rq->q->queuedata;
++	struct ufs_hba *hba = shost_priv(sdev->host);
++	unsigned long flags;
++
++	if (blk_mq_is_reserved_rq(rq))
++		return true;
++
++	spin_lock_irqsave(&hba->outstanding_lock, flags);
++	__clear_bit(rq->tag, &hba->outstanding_reqs);
++	spin_unlock_irqrestore(&hba->outstanding_lock, flags);
++
++	if (!test_bit(SCMD_STATE_COMPLETE, &cmd->state)) {
++		set_host_byte(cmd, DID_REQUEUE);
++		ufshcd_release_scsi_cmd(hba, cmd);
++		scsi_done(cmd);
++	}
++
++	return true;
++}
++
++/* Complete requests that have door-bell cleared (or, on force, all outstanding) */
+ static void ufshcd_complete_requests(struct ufs_hba *hba, bool force_compl)
+ {
+ 	if (hba->mcq_enabled)
+ 		ufshcd_mcq_compl_pending_transfer(hba, force_compl);
++	else if (force_compl)
++		/*
++		 * The controller has been reset; complete every outstanding
++		 * request (the doorbell no longer reflects them) so none strand.
++		 */
++		blk_mq_tagset_busy_iter(&hba->host->tag_set,
++					ufshcd_force_compl_one, NULL);
+ 	else
+ 		ufshcd_transfer_req_compl(hba);
+ 
+@@ -6863,6 +6979,17 @@
  
  		hba->force_reset = false;
  		spin_unlock_irqrestore(hba->host->host_lock, flags);
@@ -120,7 +251,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  		err = ufshcd_reset_and_restore(hba);
  		if (err)
  			dev_err(hba->dev, "%s: reset and restore failed with err %d\n",
-@@ -6889,6 +6935,14 @@
+@@ -6889,6 +7016,14 @@
  	}
  	ufshcd_clear_eh_in_progress(hba);
  	spin_unlock_irqrestore(hba->host->host_lock, flags);
@@ -135,7 +266,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  	ufshcd_err_handling_unprepare(hba);
  	up(&hba->host_sem);
  
-@@ -7207,6 +7261,115 @@
+@@ -7207,6 +7342,115 @@
  	return retval;
  }
  
@@ -251,7 +382,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  /**
   * ufshcd_intr - Main interrupt service routine
   * @irq: irq number
-@@ -7222,6 +7385,23 @@
+@@ -7222,6 +7466,23 @@
  	struct ufs_hba *hba = __hba;
  	u32 intr_status, enabled_intr_status;
  
@@ -275,7 +406,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  	/* Move interrupt handling to thread when MCQ & ESI are not enabled */
  	if (!hba->mcq_enabled || !hba->mcq_esi_enabled)
  		return IRQ_WAKE_THREAD;
-@@ -9729,6 +9909,7 @@
+@@ -9729,6 +9990,7 @@
  
  static void ufshcd_hba_exit(struct ufs_hba *hba)
  {
@@ -283,7 +414,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  	if (hba->is_powered) {
  		ufshcd_pm_qos_exit(hba);
  		ufshcd_exit_clk_scaling(hba);
-@@ -10182,6 +10363,17 @@
+@@ -10182,6 +10444,17 @@
  	if (ret)
  		goto out;
  
@@ -301,7 +432,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  	/* For DeepSleep, the only supported option is to have the link off */
  	WARN_ON(ufshcd_is_ufs_dev_deepsleep(hba) && !ufshcd_is_link_off(hba));
  
-@@ -10259,9 +10451,18 @@
+@@ -10259,9 +10532,18 @@
  out:
  	if (ret)
  		ufshcd_update_evt_hist(hba, UFS_EVT_WL_RES_ERR, (u32)ret);
@@ -321,7 +452,7 @@ Signed-off-by: jaewun <jaewun@users.noreply.github.com>
  	return ret;
  }
  
-@@ -10884,6 +11085,13 @@
+@@ -10884,6 +11166,13 @@
  	 */
  	hba->vcc_off_delay_us = 2000;
  
