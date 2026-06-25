@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
+
+### Restore UFS dynamic clock activity quiesced in pre/003-ufs.
+
+. /etc/profile
+
+OLD_UFS_CLKSCALE=$(get_setting "sleep.ufs.clkscale")
+if [ ! -n "${OLD_UFS_CLKSCALE}" ]; then
+  OLD_UFS_CLKSCALE=1
+fi
+
+OLD_UFS_CLKGATE=$(get_setting "sleep.ufs.clkgate")
+if [ ! -n "${OLD_UFS_CLKGATE}" ]; then
+  OLD_UFS_CLKGATE=1
+fi
+
+for ufs in /sys/devices/platform/soc@0/*.ufshc; do
+  [ -e "${ufs}/clkscale_enable" ] || continue
+  echo "${OLD_UFS_CLKSCALE}" > "${ufs}/clkscale_enable" 2>/dev/null
+  echo "${OLD_UFS_CLKGATE}"  > "${ufs}/clkgate_enable"  2>/dev/null
+done

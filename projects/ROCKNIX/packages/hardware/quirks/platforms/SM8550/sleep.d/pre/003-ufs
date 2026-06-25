@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
+
+# Quiesce UFS dynamic clock activity (devfreq clock scaling + automatic clock
+# gating) across suspend, then restore it in post/003-ufs.
+#
+# Under sustained load the UFS devfreq governor's gear-change UIC commands and
+# the clk-gating gate_work (hibern8 enter) issue UIC commands / icc-RPMh votes
+# that race the suspend descent and can wedge it. Pinning both off only for the
+# suspend window (clkscale_enable=0 + clkgate_enable=0) survived 60/60 deep
+# cycles under load, versus a wedge by cycle ~18 with them enabled. Disabling
+# only across suspend keeps full runtime power management while the device is in
+# use.
+
+. /etc/profile
+
+for ufs in /sys/devices/platform/soc@0/*.ufshc; do
+  [ -e "${ufs}/clkscale_enable" ] || continue
+  set_setting sleep.ufs.clkscale "$(cat ${ufs}/clkscale_enable 2>/dev/null)"
+  set_setting sleep.ufs.clkgate  "$(cat ${ufs}/clkgate_enable  2>/dev/null)"
+  echo 0 > "${ufs}/clkscale_enable" 2>/dev/null
+  echo 0 > "${ufs}/clkgate_enable"  2>/dev/null
+done
