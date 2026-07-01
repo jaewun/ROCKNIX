@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
 
-### Restore UFS dynamic clock activity quiesced in pre/003-ufs.
+# Restore UFS clock policy saved by pre/003-ufs.
 
 . /etc/profile
 
@@ -16,8 +16,18 @@ if [ ! -n "${OLD_UFS_CLKGATE}" ]; then
   OLD_UFS_CLKGATE=1
 fi
 
+OLD_UFS_GOVERNOR=$(get_setting "sleep.ufs.governor")
+
 for ufs in /sys/devices/platform/soc@0/*.ufshc; do
   [ -e "${ufs}/clkscale_enable" ] || continue
   echo "${OLD_UFS_CLKSCALE}" > "${ufs}/clkscale_enable" 2>/dev/null
   echo "${OLD_UFS_CLKGATE}"  > "${ufs}/clkgate_enable"  2>/dev/null
 done
+
+if [ -n "${OLD_UFS_GOVERNOR}" ]; then
+  for gov in /sys/class/devfreq/*ufshc*/governor; do
+    [ -e "${gov}" ] || continue
+    grep -qw "${OLD_UFS_GOVERNOR}" "${gov%/governor}/available_governors" 2>/dev/null || continue
+    echo "${OLD_UFS_GOVERNOR}" > "${gov}" 2>/dev/null
+  done
+fi

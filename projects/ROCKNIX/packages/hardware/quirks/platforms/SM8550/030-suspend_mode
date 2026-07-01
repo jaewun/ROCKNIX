@@ -5,19 +5,7 @@
 
 . /etc/profile.d/001-functions
 
-# SM8550 deep suspend (S2RAM) is now supported, so default the SoC to deep ("mem")
-# suspend and route the power button to it (replaces the previous blanket disable).
-
-# Pin deep-only FIRST, before enabling suspend, so there is no boot window where a
-# power event could see the fall-through list or a stale power-key binding.
-#
-# Drop systemd's "mem standby freeze" SuspendState fall-through: on SM8550 a deep
-# ("mem") attempt that fails and falls through to "freeze" (s2idle) parks forever in
-# s2idle_enter() -- the edge-triggered PMIC power-key wake is not re-delivered to
-# break the swait (lost wakeup), and with no hardware watchdog the device is then
-# unrecoverable. Deep resumes cleanly, so a failed deep should cleanly no-op instead
-# of degrading into the wedging s2idle path. SuspendState is parsed as a list
-# (drop-ins append), so reset it before pinning mem.
+# Default SM8550 devices to mem suspend and keep systemd on that state.
 mkdir -p /storage/.config/sleep.conf.d
 cat <<EOF >/storage/.config/sleep.conf.d/zz-sm8550-deeponly.conf
 [Sleep]
@@ -34,8 +22,6 @@ HandleLidSwitchExternalPower=suspend
 HandleLidSwitchDocked=ignore
 EOF
 
-# Now enable deep ("mem") suspend (sets AllowSuspend=yes + the system.suspendmode
-# setting). suspendmode restarts logind, which by now reads the config written above.
 MYSLEEPMODE=$(get_setting system.suspendmode)
 if [ -z "${MYSLEEPMODE}" ] || [ "${MYSLEEPMODE}" = "off" ]
 then

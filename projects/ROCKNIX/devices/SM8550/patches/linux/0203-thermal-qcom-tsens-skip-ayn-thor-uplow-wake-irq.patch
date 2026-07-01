@@ -11,6 +11,8 @@ kernel, so runtime testing cannot disable this wake source.
 Keep normal TSENS interrupt handling active and keep critical TSENS wake
 enabled. Only skip enable_irq_wake() for the ordinary "uplow" TSENS IRQs on
 ayn,thor.
+
+Signed-off-by: jaewun <jaewun@users.noreply.github.com>
 ---
  drivers/thermal/qcom/tsens.c | 15 ++++++++++++++-
  1 file changed, 14 insertions(+), 1 deletion(-)
