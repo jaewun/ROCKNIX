@@ -23,13 +23,16 @@ from kernel-resume-fault (0xE7 present, 0xE2 absent).
  	err = invoke_psci_fn(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND),
  			      pa_cpu_resume, 0, 0);
  	return psci_to_linux_errno(err);
-@@ -539,7 +541,10 @@
+@@ -539,9 +541,13 @@
  
  static int psci_system_suspend_enter(suspend_state_t state)
  {
--	return cpu_suspend(0, psci_system_suspend);
-+	int ret = cpu_suspend(0, psci_system_suspend);
++	int ret;
 +
+ 	pm_set_resume_via_firmware();
+ 
+-	return cpu_suspend(0, psci_system_suspend);
++	ret = cpu_suspend(0, psci_system_suspend);
 +	thor_pm_breadcrumb_atomic(0xE7);	/* SMC returned: kernel resume began */
 +	return ret;
  }
