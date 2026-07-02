@@ -1,0 +1,482 @@
+From: thorch <thorch@localhost>
+Subject: [PATCH] thor: W3 tear-proof suspend-entry latches + wake-IRQ capture
+
+The W3 wedge sits in the IRQs-off suspend-entry descent (deep noirq/syscore
+swallow, or a dpm_suspend_start callback hang). The existing breadcrumb ring
+(thor_pm_breadcrumb_mark, slot = seq % ring_slots) tears on the rapid/button
+path: a prior harvest showed inconsistent slots and only the max-seq slot read
+back reliably, and there is no phase mark anywhere past 0x35 DEEP_ENTER.
+
+Add tear-proof last-writer-wins fixed SDAM latches that bracket the entry
+descent, on top of the 0210 breadcrumb core. Shrink the ring to 2 slots
+(0x50..0x5f) to free 0x60..0x77, then add four fixed latches inside the live
+SDAM 0x50..0x7f window (clear of reboot_reason@0x48 and RTC@0xbc):
+
+  0x60 PREPARE/FREEZE - suspend_prepare() before the notifier chain + after the
+                        freezer succeeds. Disambiguates a notifier/freezer wedge
+                        from a dpm wedge (today both read "newest=0x10").
+  0x68 ENTRY_PHASE    - last-writer-wins mirror of every entry phase mark
+                        (0x10,0x11,0x20..0x25,0x35) plus a SYSCORE_GATE (0xa2)
+                        marker at the deepest legal (pre-arch_suspend_disable_irqs)
+                        point. Gives the true newest phase even when the ring
+                        tears. The gap SYSCORE_GATE -> PSCI is the irrecoverable
+                        IRQs-off window: bracketed, not markable.
+  0x70 WAKEIRQ        - two-stage. Stage-1 (hardirq, atomic-only, NO SDAM) wires
+                        the already-present-but-dead thor_pm_breadcrumb_latch_wake_irq()
+                        into irq_pm_handle_wakeup() after pm_system_irq_wakeup(),
+                        capturing the armed wake IRQ that fired mid-entry.
+                        Stage-2 (process ctx) flushes that atomic + pm_wakeup_irq()
+                        + the pm_wakeup_pending() abort flag to the latch, just
+                        before the IRQs-off descent and again after resume.
+  0x78 DEV_SUSPEND    - suspend-side device name-hash latched before each
+                        .prepare / .suspend callback (was resume-side only), so a
+                        hung suspend callback names the offending device.
+
+The SDAM/SPMI writer is process-context only and self-bails on
+in_interrupt()/irqs_disabled()/!preemptible(); Stage-1 is the only in-hardirq
+action and is atomic-only. thor_pm_breadcrumb_log_previous() now prints the
+three new latches on the next boot and thor_pm_breadcrumb_clear_locked() zeroes
+them after the harvest. Pure instrumentation; applies after 0210.
+diff --git a/include/linux/thor_pm_breadcrumb.h b/include/linux/thor_pm_breadcrumb.h
+--- a/include/linux/thor_pm_breadcrumb.h
++++ b/include/linux/thor_pm_breadcrumb.h
+@@ -74,6 +74,19 @@
+ 	THOR_PM_BC_UFS_QMP_PHY_CLK_STATE = 0x95,
+ 	THOR_PM_BC_RPMH_PD_CB = 0x96,
+ 	THOR_PM_BC_RPMH_PD_CB_DONE = 0x97,
++	/*
++	 * W3 suspend-entry tear-proof latch markers (patch 0220). These are the
++	 * "phase" field values stamped into the fixed last-writer-wins latches at
++	 * SDAM 0x60 (PREPARE/FREEZE) and 0x70 (WAKEIRQ) and 0x78 (DEV_SUSPEND).
++	 * The ENTRY_PHASE mirror latch (0x68) does NOT use a fixed marker -- it
++	 * records the real mirrored phase (0x10..0x35) so the newest entry phase
++	 * survives even when the 2-slot ring tears on the rapid/button path.
++	 */
++	THOR_PM_BC_W3_SUSPEND_PREPARE	= 0xa0,
++	THOR_PM_BC_W3_FREEZE_DONE	= 0xa1,
++	THOR_PM_BC_W3_SYSCORE_GATE	= 0xa2,
++	THOR_PM_BC_W3_WAKEIRQ		= 0xa3,
++	THOR_PM_BC_W3_DEV_SUSPEND	= 0xa4,
+ };
+ 
+ #ifdef CONFIG_THOR_PM_BREADCRUMB
+@@ -81,11 +94,20 @@
+ void thor_pm_breadcrumb_mark_error(u8 phase, u8 arg, int error);
+ void thor_pm_breadcrumb_latch_wake_irq(unsigned int irq);
+ void thor_pm_breadcrumb_latch_device(u8 phase, u32 hash);
++/* W3 (patch 0220) tear-proof suspend-entry latches. */
++void thor_pm_breadcrumb_latch_prepare(u8 phase);
++void thor_pm_breadcrumb_latch_entry(u8 phase, u8 arg, u32 data);
++void thor_pm_breadcrumb_latch_dev_suspend(u32 hash);
++void thor_pm_breadcrumb_flush_wake_irq(u8 abort);
+ #else
+ static inline void thor_pm_breadcrumb_mark(u8 phase, u8 arg, u32 data) {}
+ static inline void thor_pm_breadcrumb_mark_error(u8 phase, u8 arg, int error) {}
+ static inline void thor_pm_breadcrumb_latch_wake_irq(unsigned int irq) {}
+ static inline void thor_pm_breadcrumb_latch_device(u8 phase, u32 hash) {}
++static inline void thor_pm_breadcrumb_latch_prepare(u8 phase) {}
++static inline void thor_pm_breadcrumb_latch_entry(u8 phase, u8 arg, u32 data) {}
++static inline void thor_pm_breadcrumb_latch_dev_suspend(u32 hash) {}
++static inline void thor_pm_breadcrumb_flush_wake_irq(u8 abort) {}
+ #endif
+ 
+ static inline u32 thor_pm_breadcrumb_pack_error(int error)
+diff --git a/kernel/power/thor_pm_breadcrumb.c b/kernel/power/thor_pm_breadcrumb.c
+--- a/kernel/power/thor_pm_breadcrumb.c
++++ b/kernel/power/thor_pm_breadcrumb.c
+@@ -13,6 +13,7 @@
+ #include <linux/of.h>
+ #include <linux/printk.h>
+ #include <linux/string.h>
++#include <linux/suspend.h>
+ #include <linux/thor_pm_breadcrumb.h>
+ #include <linux/types.h>
+ 
+@@ -29,7 +30,22 @@
+  * 0x78..0x7f and the ring is shrunk to 5 slots (0x50..0x77) to make room.
+  */
+ #define THOR_PM_BC_DEV_LATCH_OFFSET	0x78
+-#define THOR_PM_BC_SLOTS		5
++/*
++ * W3 suspend-entry tear-proof latches (patch 0220). The ring tears on the
++ * rapid/button suspend-entry path (only the max-seq slot reads back reliably),
++ * so the W3 chase relies on fixed last-writer-wins latches that bracket the
++ * IRQs-off descent. Shrink the ring to 2 slots (0x50..0x5f) to free 0x60..0x77
++ * for four dedicated fixed latches inside the live SDAM 0x50..0x7f window
++ * (clear of reboot_reason@0x48 and RTC@0xbc):
++ *   0x60 PREPARE/FREEZE   - suspend_prepare + post-freeze (process ctx)
++ *   0x68 ENTRY_PHASE      - last-writer-wins mirror of every entry phase mark
++ *   0x70 WAKEIRQ          - process-ctx flush of the Stage-1 atomic wake IRQ
++ *   0x78 DEV_SUSPEND/RESUME - shared device-name-hash latch (now both sides)
++ */
++#define THOR_PM_BC_PREPARE_LATCH_OFFSET		0x60
++#define THOR_PM_BC_ENTRY_LATCH_OFFSET		0x68
++#define THOR_PM_BC_WAKEIRQ_LATCH_OFFSET		0x70
++#define THOR_PM_BC_SLOTS		2
+ #define THOR_PM_BC_MAX_BANKS		1
+ #define THOR_PM_BC_MAX_BANK_SLOTS	THOR_PM_BC_SLOTS
+ #define THOR_PM_BC_MAX_RING_SLOTS	THOR_PM_BC_SLOTS
+@@ -136,6 +152,41 @@
+ 				le16_to_cpu(dl.seq), dl.phase,
+ 				le32_to_cpu(dl.data));
+ 	}
++
++	/*
++	 * W3 (patch 0220) tear-proof suspend-entry latches: PREPARE/FREEZE
++	 * (0x60), ENTRY_PHASE mirror (0x68), and the WAKEIRQ flush (0x70). These
++	 * survive a ring tear and localize the exact wedge phase + lost wake IRQ.
++	 */
++	if (thor_pm_breadcrumb_bank_count) {
++		struct thor_pm_breadcrumb_slot wl = { };
++
++		if (nvmem_device_read(thor_pm_breadcrumb_banks[0].nvmem,
++				      THOR_PM_BC_PREPARE_LATCH_OFFSET,
++				      sizeof(wl), &wl) == sizeof(wl) &&
++		    (wl.seq || wl.phase || wl.data))
++			pr_info("previous W3 prepare-latch seq=%u phase=0x%02x\n",
++				le16_to_cpu(wl.seq), wl.phase);
++
++		memset(&wl, 0, sizeof(wl));
++		if (nvmem_device_read(thor_pm_breadcrumb_banks[0].nvmem,
++				      THOR_PM_BC_ENTRY_LATCH_OFFSET,
++				      sizeof(wl), &wl) == sizeof(wl) &&
++		    (wl.seq || wl.phase || wl.data))
++			pr_info("previous W3 entry-phase-latch seq=%u phase=0x%02x arg=0x%02x data=0x%08x\n",
++				le16_to_cpu(wl.seq), wl.phase, wl.arg,
++				le32_to_cpu(wl.data));
++
++		memset(&wl, 0, sizeof(wl));
++		if (nvmem_device_read(thor_pm_breadcrumb_banks[0].nvmem,
++				      THOR_PM_BC_WAKEIRQ_LATCH_OFFSET,
++				      sizeof(wl), &wl) == sizeof(wl) &&
++		    (wl.seq || wl.phase || wl.data))
++			pr_info("previous W3 wakeirq-latch seq=%u abort=%u stage1_irq=%u kernel_irq=%u\n",
++				le16_to_cpu(wl.seq), wl.arg,
++				le32_to_cpu(wl.data) >> 16,
++				le32_to_cpu(wl.data) & 0xffff);
++	}
+ }
+ 
+ static void thor_pm_breadcrumb_clear_locked(void)
+@@ -154,15 +205,29 @@
+ 				bank->reg, ret);
+ 	}
+ 
+-	/* Clear the fixed-slot device latch (offset 0x40) too. */
++	/*
++	 * Clear the fixed-slot device latch (0x78) and the W3 suspend-entry
++	 * latches (0x60 PREPARE/FREEZE, 0x68 ENTRY_PHASE, 0x70 WAKEIRQ) after
++	 * the harvest, so the next cycle starts from a clean window.
++	 */
+ 	if (thor_pm_breadcrumb_bank_count) {
+ 		struct thor_pm_breadcrumb_slot zero_latch = { };
+ 
+ 		nvmem_device_write(thor_pm_breadcrumb_banks[0].nvmem,
+ 				   THOR_PM_BC_DEV_LATCH_OFFSET,
+ 				   sizeof(zero_latch), &zero_latch);
++		nvmem_device_write(thor_pm_breadcrumb_banks[0].nvmem,
++				   THOR_PM_BC_PREPARE_LATCH_OFFSET,
++				   sizeof(zero_latch), &zero_latch);
++		nvmem_device_write(thor_pm_breadcrumb_banks[0].nvmem,
++				   THOR_PM_BC_ENTRY_LATCH_OFFSET,
++				   sizeof(zero_latch), &zero_latch);
++		nvmem_device_write(thor_pm_breadcrumb_banks[0].nvmem,
++				   THOR_PM_BC_WAKEIRQ_LATCH_OFFSET,
++				   sizeof(zero_latch), &zero_latch);
+ 	}
+ 
++	atomic_set(&thor_pm_breadcrumb_wake_irq, 0);
+ 	memset(thor_pm_breadcrumb_store, 0, sizeof(thor_pm_breadcrumb_store));
+ 	thor_pm_breadcrumb_seq = 0;
+ }
+@@ -325,6 +390,13 @@
+ }
+ EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_mark_error);
+ 
++/*
++ * W3 Stage-1 wake-IRQ latch. Called from irq_pm_handle_wakeup() in hardirq
++ * context with desc->lock held and IRQs disabled, AFTER pm_system_irq_wakeup().
++ * This is the ONLY legal action there: the SDAM writer sleeps on the SPMI bus,
++ * so Stage-1 is atomic-only (no SDAM write). The captured IRQ is flushed to the
++ * 0x70 latch later from process context via thor_pm_breadcrumb_flush_wake_irq().
++ */
+ void thor_pm_breadcrumb_latch_wake_irq(unsigned int irq)
+ {
+ 	if (!thor_pm_breadcrumb_machine_enabled())
+@@ -335,6 +407,93 @@
+ EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_latch_wake_irq);
+ 
+ /*
++ * Overwrite a single fixed (last-writer-wins) SDAM latch slot. Process context
++ * only -- the SDAM/SPMI bus sleeps, so this bails in any in_interrupt() /
++ * irqs-disabled / non-preemptible context (the IRQs-off descent past 0x35 is
++ * the irrecoverable window we bracket but cannot write inside). The seq counter
++ * still advances so the harvest can order latches against the ring.
++ */
++static void thor_pm_breadcrumb_write_latch(u32 offset, u8 phase, u8 arg,
++					   u32 data)
++{
++	struct thor_pm_breadcrumb_slot slot;
++	int ret;
++
++	if (!thor_pm_breadcrumb_machine_enabled())
++		return;
++	if (in_interrupt() || irqs_disabled() || !preemptible())
++		return;
++
++	mutex_lock(&thor_pm_breadcrumb_lock);
++	if (thor_pm_breadcrumb_get_locked())
++		goto out_unlock;
++
++	slot.seq = cpu_to_le16(++thor_pm_breadcrumb_seq);
++	slot.phase = phase;
++	slot.arg = arg;
++	slot.data = cpu_to_le32(data);
++
++	ret = nvmem_device_write(thor_pm_breadcrumb_banks[0].nvmem, offset,
++				 sizeof(slot), &slot);
++	if (ret != sizeof(slot) && !thor_pm_breadcrumb_write_warned) {
++		thor_pm_breadcrumb_write_warned = true;
++		pr_info("PMK8550 SDAM latch 0x%x write failed: %d\n", offset, ret);
++	}
++
++out_unlock:
++	mutex_unlock(&thor_pm_breadcrumb_lock);
++}
++
++/* 0x60 PREPARE/FREEZE latch -- suspend_prepare() + post-freeze. */
++void thor_pm_breadcrumb_latch_prepare(u8 phase)
++{
++	thor_pm_breadcrumb_write_latch(THOR_PM_BC_PREPARE_LATCH_OFFSET,
++				       phase, 0, 0);
++}
++EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_latch_prepare);
++
++/*
++ * 0x68 ENTRY_PHASE mirror latch -- last-writer-wins copy of every entry phase
++ * mark (0x10..0x35). Gives the true newest entry phase even when the 2-slot
++ * ring tears on the rapid path. Stamps the REAL phase (not a fixed marker).
++ */
++void thor_pm_breadcrumb_latch_entry(u8 phase, u8 arg, u32 data)
++{
++	thor_pm_breadcrumb_write_latch(THOR_PM_BC_ENTRY_LATCH_OFFSET,
++				       phase, arg, data);
++}
++EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_latch_entry);
++
++/* 0x78 suspend-side device latch -- name-hash of a hung .prepare/.suspend. */
++void thor_pm_breadcrumb_latch_dev_suspend(u32 hash)
++{
++	thor_pm_breadcrumb_write_latch(THOR_PM_BC_DEV_LATCH_OFFSET,
++				       THOR_PM_BC_W3_DEV_SUSPEND, 0, hash);
++}
++EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_latch_dev_suspend);
++
++/*
++ * 0x70 WAKEIRQ Stage-2 flush -- process context. Reads the Stage-1 atomic
++ * (the IRQ that called irq_pm_handle_wakeup) plus the kernel's pm_wakeup_irq()
++ * and records both, with @abort = the caller's pm_wakeup_pending() result, so
++ * the harvest shows WHICH IRQ fired mid-entry and whether it set an abort.
++ * data = (stage1_irq << 16) | pm_wakeup_irq(); arg = abort.
++ */
++void thor_pm_breadcrumb_flush_wake_irq(u8 abort)
++{
++	unsigned int stage1 = atomic_read(&thor_pm_breadcrumb_wake_irq);
++	unsigned int kirq = pm_wakeup_irq();
++
++	if (!stage1 && !kirq && !abort)
++		return;
++
++	thor_pm_breadcrumb_write_latch(THOR_PM_BC_WAKEIRQ_LATCH_OFFSET,
++				       THOR_PM_BC_W3_WAKEIRQ, abort,
++				       ((stage1 & 0xffff) << 16) | (kirq & 0xffff));
++}
++EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_flush_wake_irq);
++
++/*
+  * Overwrite the single fixed-slot device latch (SDAM offset 0x40) with the
+  * FNV-1a hash of the device currently entering resume. Called from process
+  * context (device_resume / device_resume_noirq) before dpm_run_callback, so
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -388,6 +388,9 @@
+ 	if (!sleep_state_supported(state))
+ 		return -EPERM;
+ 
++	/* W3 0x60: latch PREPARE before the notifier chain (process ctx). */
++	thor_pm_breadcrumb_latch_prepare(THOR_PM_BC_W3_SUSPEND_PREPARE);
++
+ 	pm_prepare_console();
+ 
+ 	error = pm_notifier_call_chain_robust(PM_SUSPEND_PREPARE, PM_POST_SUSPEND);
+@@ -398,8 +401,11 @@
+ 	trace_suspend_resume(TPS("freeze_processes"), 0, true);
+ 	error = suspend_freeze_processes();
+ 	trace_suspend_resume(TPS("freeze_processes"), 0, false);
+-	if (!error)
++	if (!error) {
++		/* W3 0x60: latch FREEZE_DONE after freezer success. */
++		thor_pm_breadcrumb_latch_prepare(THOR_PM_BC_W3_FREEZE_DONE);
+ 		return 0;
++	}
+ 
+ 	dpm_save_failed_step(SUSPEND_FREEZE);
+ 	filesystems_thaw();
+@@ -433,12 +439,15 @@
+ 	int error;
+ 
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_SUSPEND_ENTER, state, 0);
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_SUSPEND_ENTER, state, 0);
+ 
+ 	error = platform_suspend_prepare(state);
+ 	if (error)
+ 		goto Platform_finish;
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_PLATFORM_PREP, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_PLATFORM_PREP, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 
+ 	error = dpm_suspend_late(PMSG_SUSPEND);
+ 	if (error) {
+@@ -447,12 +456,16 @@
+ 	}
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_DPM_LATE, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_DPM_LATE, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 
+ 	error = platform_suspend_prepare_late(state);
+ 	if (error)
+ 		goto Devices_early_resume;
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_PLATFORM_LATE, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_PLATFORM_LATE, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 
+ 	error = dpm_suspend_noirq(PMSG_SUSPEND);
+ 	if (error) {
+@@ -461,12 +474,16 @@
+ 	}
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_DPM_NOIRQ, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_DPM_NOIRQ, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 
+ 	error = platform_suspend_prepare_noirq(state);
+ 	if (error)
+ 		goto Platform_wake;
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_PLATFORM_NOIRQ, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_PLATFORM_NOIRQ, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 
+ 	if (suspend_test(TEST_PLATFORM))
+ 		goto Platform_wake;
+@@ -481,6 +498,20 @@
+ 		goto Enable_cpus;
+ 
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_DEEP_ENTER, state, pm_wakeup_irq());
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_DEEP_ENTER, state,
++				       pm_wakeup_irq());
++	/*
++	 * W3 0x68: SYSCORE_GATE is the deepest LEGAL process-context latch -- it
++	 * is the last point before arch_suspend_disable_irqs(). Everything past
++	 * here (syscore_suspend, the *wakeup=pm_wakeup_pending() gate, PSCI
++	 * descent) runs IRQs-off and the SDAM/SPMI writer self-bails there, so
++	 * the gap 0x68=SYSCORE_GATE -> PSCI is the irrecoverable window we
++	 * bracket but cannot mark inside. Also flush any Stage-1 wake IRQ that
++	 * already landed (process ctx, IRQs still on) before we descend.
++	 */
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_W3_SYSCORE_GATE, state,
++				       pm_wakeup_irq());
++	thor_pm_breadcrumb_flush_wake_irq(pm_wakeup_pending());
+ 
+ 	arch_suspend_disable_irqs();
+ 	BUG_ON(!irqs_disabled());
+@@ -544,6 +575,7 @@
+ 	pm_suspend_target_state = state;
+ 
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_SUSPEND_START, state, 0);
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_SUSPEND_START, state, 0);
+ 
+ 	if (state == PM_SUSPEND_TO_IDLE)
+ 		pm_set_suspend_no_platform();
+@@ -561,6 +593,8 @@
+ 	}
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_DPM_START_DONE, state,
+ 				thor_pm_breadcrumb_pack_error(error));
++	thor_pm_breadcrumb_latch_entry(THOR_PM_BC_DPM_START_DONE, state,
++				       thor_pm_breadcrumb_pack_error(error));
+ 	suspend_test_finish("suspend devices");
+ 	if (suspend_test(TEST_DEVICES))
+ 		goto Recover_platform;
+@@ -573,6 +607,8 @@
+ 	suspend_test_start();
+ 	thor_pm_breadcrumb_mark(THOR_PM_BC_RESUME_DEVICES, state, pm_wakeup_irq());
+ 	dpm_resume_end(PMSG_RESUME);
++	/* W3 0x70 Stage-2: flush the wake IRQ that actually resumed us. */
++	thor_pm_breadcrumb_flush_wake_irq(0);
+ 	suspend_test_finish("resume devices");
+ 	trace_suspend_resume(TPS("console_resume_all"), state, true);
+ 	console_resume_all();
+diff --git a/kernel/irq/pm.c b/kernel/irq/pm.c
+--- a/kernel/irq/pm.c
++++ b/kernel/irq/pm.c
+@@ -10,6 +10,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/suspend.h>
+ #include <linux/syscore_ops.h>
++#include <linux/thor_pm_breadcrumb.h>
+ 
+ #include "internals.h"
+ 
+@@ -20,6 +21,14 @@
+ 	desc->depth++;
+ 	irq_disable(desc);
+ 	pm_system_irq_wakeup(irq_desc_get_irq(desc));
++	/*
++	 * W3 Stage-1: capture the armed wake IRQ that just aborted (or tried to
++	 * abort) the suspend. Hardirq context, desc->lock held, IRQs disabled --
++	 * atomic-only, NO SDAM write (the SPMI bus sleeps). Flushed to the 0x70
++	 * latch from process context later. This is the heart of the W3 chase:
++	 * it names WHICH IRQ's wake fired mid-entry.
++	 */
++	thor_pm_breadcrumb_latch_wake_irq(irq_desc_get_irq(desc));
+ }
+ 
+ /*
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -1976,6 +1976,12 @@
+ 		callback = pm_op(dev->driver->pm, state);
+ 	}
+ 
++	/*
++	 * W3 0x78: latch the suspend-side device name-hash before its .suspend
++	 * callback runs, mirroring the resume-side latch. A device whose
++	 * .suspend deadlocks leaves its hash latched for the next boot (#2).
++	 */
++	thor_pm_breadcrumb_latch_dev_suspend(thor_pm_dev_hash(dev_name(dev)));
+ 	error = dpm_run_callback(callback, dev, state, info);
+ 
+  End:
+@@ -2180,8 +2186,16 @@
+ 	if (!callback && dev->driver && dev->driver->pm)
+ 		callback = dev->driver->pm->prepare;
+ 
+-	if (callback)
++	if (callback) {
++		/*
++		 * W3 0x78: latch the device name-hash before its .prepare
++		 * callback runs, so a .prepare that deadlocks (e.g. a pwrkey
++		 * wake re-entering logind mid-dpm_prepare) leaves its hash
++		 * latched for the next boot (#2).
++		 */
++		thor_pm_breadcrumb_latch_dev_suspend(thor_pm_dev_hash(dev_name(dev)));
+ 		ret = callback(dev);
++	}
+ 
+ unlock:
+ 	device_unlock(dev);

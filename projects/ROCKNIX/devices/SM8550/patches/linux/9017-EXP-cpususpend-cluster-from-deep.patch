@@ -1,0 +1,24 @@
+From: Luke Johnson <jaewun@me.com>
+Subject: [PATCH] EXP: enter cluster collapse via CPU_SUSPEND from deep suspend (Thor)
+---
+--- a/drivers/firmware/psci/psci.c
++++ b/drivers/firmware/psci/psci.c
+@@ -533,9 +533,15 @@
+ 	int err;
+ 	phys_addr_t pa_cpu_resume = __pa_symbol(cpu_resume);
+ 
+-	thor_pm_breadcrumb_atomic(0xE6);	/* last SW before SYSTEM_SUSPEND SMC */
+-	err = invoke_psci_fn(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND),
+-			      pa_cpu_resume, 0, 0);
++	thor_pm_breadcrumb_atomic(0xE6);	/* last SW before CPU_SUSPEND(cluster) SMC */
++	/*
++	 * AYN Thor experiment: enter the cluster deep-collapse state (0x4100c344,
++	 * the SoC-wide "system power collapse") via CPU_SUSPEND from the wake-armed
++	 * deep-suspend flow, instead of the SYSTEM_SUSPEND SMC that qcom firmware
++	 * abandoned. CPU_SUSPEND(power_state, entry_point, context_id).
++	 */
++	err = invoke_psci_fn(PSCI_FN_NATIVE(0_2, CPU_SUSPEND),
++			      0x4100c344, pa_cpu_resume, 0);
+ 	return psci_to_linux_errno(err);
+ }
+ 

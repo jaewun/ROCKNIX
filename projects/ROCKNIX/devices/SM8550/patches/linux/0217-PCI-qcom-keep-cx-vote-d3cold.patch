@@ -1,0 +1,17 @@
+From: Luke Johnson <jaewun@me.com>
+Subject: [PATCH] PCI: qcom: keep CX perf-state vote across d3cold suspend (Thor wake)
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2165,7 +2165,10 @@
+ 		if (ret)
+ 			dev_err(dev, "Failed to floor CPU-PCIe interconnect path: %d\n", ret);
+ 
+-		if (pcie->use_pm_opp)
++		/* V-OPP: keep the PCIe RPMh perf-state (CX corner) vote through
++		 * suspend — dropping it makes the CX collapse unwakeable on Thor
++		 * (AOP cannot restore from CXPC; exhaustively verified). */
++		if (0 && pcie->use_pm_opp)
+ 			dev_pm_opp_set_opp(pcie->pci->dev, NULL);
+ 	} else {
+ 		/*

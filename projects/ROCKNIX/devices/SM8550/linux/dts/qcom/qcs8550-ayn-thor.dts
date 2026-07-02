@@ -13,6 +13,29 @@
 	qcom,msm-id = <603 0x20000>;
 	qcom,board-id = <0x1001f 0>;
 
+	/*
+	 * CX WAKE-restore: cx_ao (active-only peer of cx) held at NOM makes the
+	 * shared cx.lvl WAKE TCS = 256 while SLEEP TCS stays 0. CX fully collapses
+	 * during suspend (cxsd) but is restored to NOM on wake. Paired with the
+	 * CPU_SUSPEND(0x4100c344)-from-wake-armed-deep-path entry (patch 9017).
+	 */
+	cx_ao_wake: cx-ao-wake {
+		compatible = "thor,cx-ao-keepalive";
+		power-domains = <&rpmhpd RPMHPD_CX_AO>;
+		required-opps = <&rpmhpd_opp_nom>;
+	};
+
+	/*
+	 * MX WAKE-restore companion: the APPS WAKE TCS is otherwise EMPTY (proven
+	 * via rpmh_flush instrumentation). CXPC minimizes CX AND MX; a CX-only
+	 * wake vote was insufficient, so stage mx.lvl sleep=0/wake=nom too.
+	 */
+	mx_ao_wake: mx-ao-wake {
+		compatible = "thor,cx-ao-keepalive";
+		power-domains = <&rpmhpd RPMHPD_MX_AO>;
+		required-opps = <&rpmhpd_opp_nom>;
+	};
+
 	gpio-keys-ayn {
 		compatible = "gpio-keys";
 

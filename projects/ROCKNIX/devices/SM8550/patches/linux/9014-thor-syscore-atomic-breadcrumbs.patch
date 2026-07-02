@@ -1,0 +1,131 @@
+From: thorch <thorch@localhost>
+Subject: [PATCH] thor: syscore atomic SDAM breadcrumbs (irqs-off, diagnostic)
+
+Add an irqs-off-safe SDAM writer (raw pmic-arb SPMI) so the deep
+syscore/PSCI region past SYSCORE_GATE can be traced: 0xE0 syscore entry,
+0xE1 syscore done (entering PSCI collapse), 0xE2 syscore_resume entry.
+Written to SDAM 0x70; read raw after a wedge+reboot to tell never-woke
+(last=0xE1) from woke-but-resume-crash (0xE2 present).
+---
+--- a/kernel/power/thor_pm_breadcrumb.c
++++ b/kernel/power/thor_pm_breadcrumb.c
+@@ -12,6 +12,7 @@
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of.h>
+ #include <linux/printk.h>
++#include <linux/spmi.h>
+ #include <linux/string.h>
+ #include <linux/suspend.h>
+ #include <linux/thor_pm_breadcrumb.h>
+@@ -69,6 +70,7 @@
+ static struct thor_pm_breadcrumb_bank thor_pm_breadcrumb_banks[THOR_PM_BC_MAX_BANKS];
+ static bool thor_pm_breadcrumb_checked;
+ static u16 thor_pm_breadcrumb_seq;
++static struct spmi_device *thor_pm_bc_sdev;	/* AYN Thor: irqs-off SDAM writes */
+ static atomic_t thor_pm_breadcrumb_wake_irq = ATOMIC_INIT(0);
+ static atomic_t thor_pm_breadcrumb_sticky_error = ATOMIC_INIT(0);
+ static bool thor_pm_breadcrumb_write_warned;
+@@ -279,6 +281,25 @@
+ 	pr_info("using PMK8550 SDAM 0x%04x offset 0x%x for %u breadcrumb slots\n",
+ 		reg, offset, slots);
+ 
++	/* AYN Thor: cache the SPMI device for irqs-off (syscore) SDAM writes. */
++	if (!thor_pm_bc_sdev) {
++		struct device_node *np, *pmic;
++
++		for_each_compatible_node(np, NULL, "qcom,spmi-sdam") {
++			u32 r;
++
++			if (!of_property_read_u32(np, "reg", &r) && r == reg) {
++				pmic = of_get_parent(np);
++				thor_pm_bc_sdev = spmi_find_device_by_of_node(pmic);
++				of_node_put(pmic);
++				of_node_put(np);
++				break;
++			}
++		}
++		pr_info("atomic SDAM writer: spmi dev %s\n",
++			thor_pm_bc_sdev ? "acquired" : "UNAVAILABLE");
++	}
++
+ 	return 0;
+ }
+ 
+@@ -531,6 +552,21 @@
+ }
+ EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_latch_device);
+ 
++/*
++ * AYN Thor: irqs-off-safe SDAM write for the syscore/PSCI region (the normal
++ * nvmem/regmap path sleeps). One byte to SDAM 0x70 via the atomic pmic-arb SPMI
++ * path. Last-writer-wins: 0xE0 syscore entry, 0xE1 syscore done (entering PSCI),
++ * 0xE2 syscore_resume entry (woke). Read raw SDAM 0x70 after wedge+reboot.
++ */
++void thor_pm_breadcrumb_atomic(u8 phase)
++{
++	u8 b = phase;
++
++	if (thor_pm_bc_sdev)
++		spmi_ext_register_writel(thor_pm_bc_sdev, 0x7100 + 0x70, &b, 1);
++}
++EXPORT_SYMBOL_GPL(thor_pm_breadcrumb_atomic);
++
+ static int __init thor_pm_breadcrumb_init(void)
+ {
+ 	if (!thor_pm_breadcrumb_machine_enabled())
+--- a/include/linux/thor_pm_breadcrumb.h
++++ b/include/linux/thor_pm_breadcrumb.h
+@@ -91,6 +91,7 @@
+ 
+ #ifdef CONFIG_THOR_PM_BREADCRUMB
+ void thor_pm_breadcrumb_mark(u8 phase, u8 arg, u32 data);
++void thor_pm_breadcrumb_atomic(u8 phase);
+ void thor_pm_breadcrumb_mark_error(u8 phase, u8 arg, int error);
+ void thor_pm_breadcrumb_latch_wake_irq(unsigned int irq);
+ void thor_pm_breadcrumb_latch_device(u8 phase, u32 hash);
+@@ -101,6 +102,7 @@
+ void thor_pm_breadcrumb_flush_wake_irq(u8 abort);
+ #else
+ static inline void thor_pm_breadcrumb_mark(u8 phase, u8 arg, u32 data) {}
++static inline void thor_pm_breadcrumb_atomic(u8 phase) {}
+ static inline void thor_pm_breadcrumb_mark_error(u8 phase, u8 arg, int error) {}
+ static inline void thor_pm_breadcrumb_latch_wake_irq(unsigned int irq) {}
+ static inline void thor_pm_breadcrumb_latch_device(u8 phase, u32 hash) {}
+--- a/drivers/base/syscore.c
++++ b/drivers/base/syscore.c
+@@ -44,6 +44,8 @@
+  *
+  * This function is executed with one CPU on-line and disabled interrupts.
+  */
++#include <linux/thor_pm_breadcrumb.h>
++
+ int syscore_suspend(void)
+ {
+ 	struct syscore *syscore;
+@@ -56,6 +58,8 @@
+ 	if (pm_wakeup_pending())
+ 		return -EBUSY;
+ 
++	thor_pm_breadcrumb_atomic(0xE0);	/* syscore_suspend entry */
++
+ 	WARN_ONCE(!irqs_disabled(),
+ 		"Interrupts enabled before system core suspend.\n");
+ 
+@@ -70,6 +74,8 @@
+ 				syscore->ops->suspend);
+ 		}
+ 
++	thor_pm_breadcrumb_atomic(0xE1);	/* syscore done, entering PSCI collapse */
++
+ 	trace_suspend_resume(TPS("syscore_suspend"), 0, false);
+ 	return 0;
+ 
+@@ -94,6 +100,8 @@
+ {
+ 	struct syscore *syscore;
+ 
++	thor_pm_breadcrumb_atomic(0xE2);	/* syscore_resume entry (woke) */
++
+ 	trace_suspend_resume(TPS("syscore_resume"), 0, true);
+ 	WARN_ONCE(!irqs_disabled(),
+ 		"Interrupts enabled before system core resume.\n");
