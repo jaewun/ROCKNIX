@@ -5,7 +5,10 @@
 
 . /etc/profile.d/001-functions
 
-# Default SM8550 devices to mem suspend and keep systemd on that state.
+# Keep systemd on SuspendState=mem: the kernel maps "mem" through
+# /sys/power/mem_sleep, which the SM8550 cmdline defaults to s2idle
+# (mem_sleep_default=s2idle). Deep remains available as an opt-in via
+# /sys/power/mem_sleep without changing systemd config.
 mkdir -p /storage/.config/sleep.conf.d
 cat <<EOF >/storage/.config/sleep.conf.d/zz-sm8550-deeponly.conf
 [Sleep]
