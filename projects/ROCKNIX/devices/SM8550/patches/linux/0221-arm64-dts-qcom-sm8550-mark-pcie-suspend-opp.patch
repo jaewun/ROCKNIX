@@ -1,0 +1,64 @@
+From: ROCKNIX SM8550 <rocknix@rocknix.org>
+Date: Fri, 3 Jul 2026 00:00:00 +1200
+Subject: [PATCH] arm64: dts: qcom: sm8550: mark PCIe suspend OPPs
+
+On SM8550/QCS8550 the PCIe controllers use OPP for bandwidth voting
+(use_pm_opp), so the OPP table's opp-peak-kBps values are the only
+source of the MC0 (DDR) and SH0 (LLCC) sleep-set bandwidth votes for
+the PCIe memory path.  pcie-qcom now selects the generic suspend OPP
+(dev_pm_opp_get_suspend_opp_freq()) instead of dropping the OPP to
+NULL during non-S2RAM suspend: zeroing those sleep-set votes removes
+the memory-path bandwidth contract the AOP needs to bring the SoC back
+out of cluster_sleep_1 (PSCI 0x4100c344), and the firmware never
+returns on resume.
+
+Mark the lowest OPP (2.5 GT/s x1, low_svs, 250000 kBps) in both PCIe
+OPP tables as the suspend OPP so the floor vote is retained across
+suspend.  pcie0 is the WiFi link on all supported devices; pcie1 is
+active on the AYANEO Pocket family (Renesas uPD720201 USB3 host).
+---
+ arch/arm64/boot/dts/qcom/sm8550.dtsi | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/arch/arm64/boot/dts/qcom/sm8550.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8550.dtsi
+@@ -2398,18 +2398,19 @@
+ 			pcie0_opp_table: opp-table {
+ 				compatible = "operating-points-v2";
+ 
+ 				/* 2.5 GT/s x1 */
+ 				opp-2500000-1 {
+ 					opp-hz = /bits/ 64 <2500000>;
+ 					required-opps = <&rpmhpd_opp_low_svs>;
+ 					opp-peak-kBps = <250000 1>;
+ 					opp-level = <1>;
++					opp-suspend;
+ 				};
+ 
+ 				/* 2.5 GT/s x2 */
+ 				opp-5000000-1 {
+ 					opp-hz = /bits/ 64 <5000000>;
+ 					required-opps = <&rpmhpd_opp_low_svs>;
+ 					opp-peak-kBps = <500000 1>;
+ 					opp-level = <1>;
+ 				};
+@@ -2577,18 +2578,19 @@
+ 			pcie1_opp_table: opp-table {
+ 				compatible = "operating-points-v2";
+ 
+ 				/* 2.5 GT/s x1 */
+ 				opp-2500000-1 {
+ 					opp-hz = /bits/ 64 <2500000>;
+ 					required-opps = <&rpmhpd_opp_low_svs>;
+ 					opp-peak-kBps = <250000 1>;
+ 					opp-level = <1>;
++					opp-suspend;
+ 				};
+ 
+ 				/* 2.5 GT/s x2 */
+ 				opp-5000000-1 {
+ 					opp-hz = /bits/ 64 <5000000>;
+ 					required-opps = <&rpmhpd_opp_low_svs>;
+ 					opp-peak-kBps = <500000 1>;
+ 					opp-level = <1>;
+ 				};
